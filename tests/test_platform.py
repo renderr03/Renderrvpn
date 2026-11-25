@@ -1,6 +1,8 @@
+import os
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,7 +33,7 @@ class FakePanel:
         self.lose_response = False
 
     def request(self, service, url, *, payload, token):
-        if service != "3x-ui" or token != "secret-panel-token":
+        if service != "3x-ui" or token not in {"secret-panel-token", "rotated-token"}:
             raise AssertionError("wrong service or token")
         if self.offline:
             raise ServiceError("3x-ui", "нет соединения")
@@ -40,7 +42,14 @@ class FakePanel:
             target = int(route.rsplit("/", 1)[1])
             records = [v for v in self.records.values() if v["client"]["tgId"] == target]
             return {"success": True, "obj": records}
-        if route == "inbounds/get/7":
+        if route == "inbounds/options":
+            return {"success": True, "obj": [
+                {"id": 7, "remark": "Германия", "protocol": "vless", "tlsFlowCapable": True},
+                {"id": 8, "remark": "Нидерланды", "protocol": "vless", "tlsFlowCapable": False},
+            ]}
+        if route == "setting/all":
+            return {"success": True, "obj": {"subURI": "https://sub.test/sub/"}}
+        if route in {"inbounds/get/7", "inbounds/get/8"}:
             return {"success": True, "obj": {"enable": True, "protocol": "vless"}}
         if route == "server/status":
             return {"success": True, "obj": {"xray": {"state": "running"}}}
@@ -99,6 +108,115 @@ class PlatformTests(unittest.TestCase):
         row = self.store.next_access(now)
         self.assertIsNotNone(row)
         synchronize_access(self.store, self.bot, row, now)
+
+    def click(self, user, action, *, chat_type="private"):
+        chat = {"id": user, "type": chat_type}
+        self.bot.handle({"callback_query": {"id": "cb", "from": {"id": user},
+                                           "message": {"chat": chat}, "data": action}})
+
+    def speak(self, user, text):
+        self.bot.handle({"message": {"chat": {"id": user, "type": "private"}, "from": {"id": user},
+                                     "message_id": 1, "text": text}})
+
+    def button(self, text):
+        rows = self.telegram.calls[-1][1]["reply_markup"]["inline_keyboard"]
+        return next(btn["callback_data"] for row in rows for btn in row if text in btn["text"])
+
+    def click_label(self, text):
+        self.click(5, self.button(text))
+
+    def inline_admin_task(self, user, callback, on_error=None):
+        try:
+            callback(self.store)
+        except (ValueError, ServiceError) as exc:
+            if on_error:
+                on_error(str(exc))
+            else:
+                raise
+        return True
+
+    def test_install_config_accepts_only_bot_token_and_admin_id(self):
+        env = {"TELEGRAM_BOT_TOKEN": "123456:exampleTokenPlaceholder00", "ADMIN_IDS": "5",
+               "NODES_FILE": str(Path(self.tmp.name) / "absent.json")}
+        with patch.dict(os.environ, env, clear=True):
+            config = Config.from_env()
+        self.assertEqual(config.admins, {5})
+        self.assertEqual(config.nodes, {})
+        self.assertEqual(config.support, "")
+        self.assertEqual(config.terms_url, "")
+
+    def test_connect_panels_use_sqlite_and_can_grant_from_buttons(self):
+        self.bot.config = replace(self.config, nodes={}, support="", terms_url="")
+        with patch.object(self.bot, "admin_task", side_effect=self.inline_admin_task):
+            self.speak(5, "/start")
+            self.click_label("Админка")
+            self.click_label("Добавить основную панель")
+            self.speak(5, "https://panel.test/hidden/panel/inbounds")
+            self.speak(5, "secret-panel-token")
+            self.assertEqual(self.store.nodes({}), {})
+            self.click_label("Германия")
+            self.click_label("Подключить ноду")
+            saved, = self.store.nodes({}).values()
+            self.assertEqual(saved.api_url, "https://panel.test/hidden")
+            self.assertEqual(saved.subscription_url, "https://sub.test/sub")
+            self.assertEqual(saved.inbound_id, 7)
+            self.assertEqual(saved.flow, "xtls-rprx-vision")
+            self.assertIn("deleteMessage", [event for event, _ in self.telegram.calls])
+            self.assertFalse(any("secret-panel-token" in str(value) for _, value in self.telegram.calls))
+            self.click(5, "a:addnode")
+            self.click_label("Из панели")
+            self.click_label("Нидерланды")
+            self.click_label("Подключить ноду")
+            self.assertEqual({n.inbound_id for n in self.store.nodes({}).values()}, {7, 8})
+            self.click(5, f"a:rotate:{saved.key}")
+            self.speak(5, "rotated-token")
+            self.click_label("Сохранить")
+            self.assertEqual({n.token for n in self.store.nodes({}).values()}, {"rotated-token"})
+            self.click(5, "a:clients")
+            self.speak(5, "123")
+            self.click_label("Выдать или продлить")
+            self.click_label("30 дней")
+            self.click_label("Германия")
+            self.click_label("Подтвердить")
+            self.apply()
+            self.click(123, "subscription")
+            self.assertIn("https://sub.test/sub/", self.telegram.calls[-1][1]["text"])
+
+    def test_button_only_settings_back_and_cancel(self):
+        self.click(5, "a:price")
+        self.click_label("Отмена")
+        self.speak(5, "17")
+        self.assertIsNone(self.store.one("SELECT * FROM approvals"))
+        self.click(5, "a:tariffs")
+        self.click_label("Изменить цену")
+        self.speak(5, "17")
+        confirm = self.button("Подтвердить")
+        self.click_label("Отмена")
+        self.click(5, confirm)
+        self.assertEqual(self.bot.price(), 150)
+        self.click(5, "a:tariffs")
+        self.click_label("Изменить цену")
+        self.speak(5, "175")
+        self.click_label("Подтвердить")
+        self.assertEqual(self.bot.price(), 175)
+        self.click(5, "a:settings")
+        self.click_label("Контакт поддержки")
+        self.speak(5, "@new_support")
+        self.assertEqual(self.bot.setting("support"), "new_support")
+        self.click(123, "support")
+        self.assertEqual(self.telegram.calls[-1][1]["reply_markup"]["inline_keyboard"][0][0]["url"], "https://t.me/new_support")
+
+    def test_cancelled_node_draft_cannot_be_saved(self):
+        self.bot.config = replace(self.config, nodes={})
+        with patch.object(self.bot, "admin_task", side_effect=self.inline_admin_task):
+            self.click(5, "a:addnode")
+            self.speak(5, "http://127.0.0.1:2053/hidden")
+            self.speak(5, "secret-panel-token")
+            self.click_label("Германия")
+            save = self.button("Подключить ноду")
+            self.click_label("Отмена")
+            self.click(5, save)
+        self.assertEqual(self.store.nodes({}), {})
 
     def test_payment_is_idempotent_and_renewal_keeps_link(self):
         invoice = self.checkout(123, 1)
@@ -188,7 +306,7 @@ class PlatformTests(unittest.TestCase):
         self.bot.handle({"message": {"chat": chat, "from": {"id": user}, "date": self.now,
                                      "successful_payment": payment}})
         self.apply()
-        self.bot.handle({"message": {"chat": chat, "from": {"id": user}, "text": "/subscription"}})
+        self.click(user, "subscription")
         text = self.telegram.calls[-1][1]["text"]
         self.assertIn(Panel(self.node).link(self.store.access(user)), text)
         self.assertNotIn(self.node.token, text)
@@ -198,9 +316,9 @@ class PlatformTests(unittest.TestCase):
         self.assertFalse(next(iter(self.panel.records.values()))["client"]["enable"])
 
     def test_admin_only_in_private_chat(self):
-        self.bot.handle({"message": {"chat": {"id": 5, "type": "group"}, "from": {"id": 5}, "text": "/price 17"}})
-        self.bot.handle({"message": {"chat": {"id": 7, "type": "private"}, "from": {"id": 7}, "text": "/price 17"}})
-        self.assertFalse(self.telegram.calls)
+        self.click(5, "a:price", chat_type="group")
+        self.click(7, "a:price")
+        self.assertTrue(all(method == "answerCallbackQuery" for method, _ in self.telegram.calls))
         self.assertIsNone(self.store.one("SELECT * FROM approvals"))
 
     def test_wrong_upstream_client_identity_does_not_mutate_panel(self):

@@ -4,6 +4,9 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import asdict, replace
+
+from .config import Node
 
 
 DAY = 86_400
@@ -65,6 +68,10 @@ CREATE TABLE IF NOT EXISTS audit (
     args TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS nodes (
+    key TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS node_sales (
     node TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL
@@ -100,6 +107,38 @@ class Store:
 
     def set_setting(self, key, value):
         self.db.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (key, str(value)))
+
+    def nodes(self, defaults):
+        result = dict(defaults)
+        for row in self.db.execute("SELECT data FROM nodes ORDER BY rowid"):
+            node = Node.read(json.loads(row["data"]))
+            result[node.key] = node
+        return result
+
+    def save_node(self, node, defaults, admin_id, *, rotate=False):
+        with self.write():
+            known = self.nodes(defaults)
+            if rotate:
+                if node.key not in known:
+                    raise ValueError("Локация больше не найдена.")
+            else:
+                if len(known) >= 20:
+                    raise ValueError("Можно подключить до 20 локаций.")
+                if any((item.api_url, item.inbound_id) == (node.api_url, node.inbound_id) for item in known.values()):
+                    raise ValueError("Этот inbound уже подключён.")
+            targets = [replace(item, token=node.token) for item in known.values()
+                       if item.api_url == node.api_url] if rotate else [node]
+            self.db.executemany(
+                "INSERT INTO nodes VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data",
+                ((item.key, json.dumps(asdict(item))) for item in targets),
+            )
+            self.log_action(admin_id, "смена токена панели" if rotate else "подключение ноды", {"node": node.key})
+
+    def log_action(self, admin_id, action, args):
+        self.db.execute(
+            "INSERT INTO audit(admin_id, action, args, created_at) VALUES (?, ?, ?, ?)",
+            (admin_id, action, json.dumps(args), int(time.time())),
+        )
 
     def sales_open(self, node):
         row = self.one("SELECT enabled FROM node_sales WHERE node = ?", node)

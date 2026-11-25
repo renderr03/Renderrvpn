@@ -80,6 +80,20 @@ class Panel:
             raise ServiceError("3x-ui", "панель отклонила операцию")
         return data.get("obj")
 
+    def catalog(self):
+        options = self.call("inbounds/options")
+        if not isinstance(options, list):
+            raise ServiceError("3x-ui")
+        options = [item for item in options if item.get("protocol") == "vless" and type(item.get("id")) is int]
+        subscription = ""
+        try:
+            settings = self.call("setting/all", {})
+            if isinstance(settings, dict):
+                subscription = settings.get("subURI") or ""
+        except ServiceError:
+            pass
+        return options, subscription
+
     def health(self):
         status = self.call("server/status")
         inbound = self.call(f"inbounds/get/{self.node.inbound_id}")

@@ -1,42 +1,18 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from threading import BoundedSemaphore
 
 from .assistant import interpret
 from .config import integer
+from .menu import AdminMenu, USER_ID_MAX, back, button
 from .services import Panel, ServiceError
 from .store import Store
 
 
 LOG = logging.getLogger(__name__)
-USER_ID_MAX = 2**52 - 1
-ADMIN_HELP = (
-    "/client ID — найти подписку\n"
-    "/grant ID ДНИ [НОДА] — выдать или продлить доступ\n"
-    "/revoke ID — отключить доступ\n"
-    "/retry ID — повторить синхронизацию с панелью\n"
-    "/price STARS — изменить цену на 30 дней\n"
-    "/trial ДНИ — настроить пробный период (0 отключает)\n"
-    "/sales НОДА on|off — открыть или закрыть новые продажи\n"
-    "/refund НОМЕР — вернуть платёж из списка\n"
-    "/audit — журнал изменений\n"
-)
-COMMANDS = {
-    "/client": ("find", ("user",)),
-    "/grant": ("grant", ("user", "days", "node")),
-    "/revoke": ("revoke", ("user",)),
-    "/retry": ("retry", ("user",)),
-    "/price": ("price", ("amount",)),
-    "/trial": ("trial", ("days",)),
-    "/sales": ("sales", ("node", "enabled")),
-    "/refund": ("refund", ("payment",)),
-}
-
-
-def button(title, action):
-    return {"text": title, "callback_data": action}
 
 
 def date(timestamp):
@@ -65,12 +41,19 @@ class Bot:
         self.telegram = telegram
         self.tasks = ThreadPoolExecutor(max_workers=2, thread_name_prefix="admin")
         self.task_slots = BoundedSemaphore(2)
+        self.menu = AdminMenu(self)
 
     def send(self, chat, text, rows=None):
         payload = {"chat_id": chat, "text": text, "link_preview_options": {"is_disabled": True}}
         if rows:
             payload["reply_markup"] = {"inline_keyboard": rows}
         return self.telegram.call("sendMessage", **payload)
+
+    def setting(self, key, db=None):
+        return (db or self.store).setting(key, getattr(self.config, key))
+
+    def nodes(self, db=None):
+        return (db or self.store).nodes(self.config.nodes)
 
     def price(self):
         return int(self.store.setting("price", self.config.price))
@@ -79,32 +62,39 @@ class Bot:
         return int(self.store.setting("trial", self.config.trial_days))
 
     def support(self, chat):
-        self.send(
-            chat, "По вопросам подключения, оплаты и возвратов напиши владельцу сервиса через кнопку ниже.",
-            [[{"text": "Написать в поддержку", "url": f"https://t.me/{self.config.support}"}]],
-        )
+        name = self.setting("support")
+        rows = [[{"text": "Написать в поддержку", "url": f"https://t.me/{name}"}]] if name else []
+        text = "По вопросам подключения, оплаты и возвратов напиши владельцу сервиса." if name else "Владелец ещё настраивает контакт поддержки."
+        self.send(chat, text, rows + back("home"))
 
     def terms(self, user, key=None):
-        rows = [[{"text": "Открыть условия", "url": self.config.terms_url}]]
+        url = self.setting("terms_url")
+        if not url or not self.setting("support"):
+            raise ValueError("Оплата станет доступна после настройки условий и поддержки.")
+        rows = [[{"text": "Открыть условия", "url": url}]]
         if key:
             rows.append([button("Принимаю условия · получить счёт", f"invoice:{key}")])
-        self.send(user, "Условия покупки VPN" if key is None else "Прочитай условия и подтверди их, чтобы получить счёт.", rows)
+        self.send(user, "Условия покупки VPN" if key is None else "Прочитай условия и подтверди их, чтобы получить счёт.",
+                  rows + back("shop"))
 
     def start(self, user):
+        self.menu.leave(user)
         rows = [
             [button("Подключить VPN", "shop"), button("Моя подписка", "subscription")],
             [button("Как подключиться", "help"), button("Поддержка", "support")],
+            [button("Мой Telegram ID", "myid")],
         ]
         if user in self.config.admins:
             rows.append([button("Админка", "admin")])
-        self.send(user, self.config.brand + ("\n\n" + self.config.welcome if self.config.welcome else ""), rows)
+        welcome = self.setting("welcome")
+        self.send(user, self.setting("brand") + ("\n\n" + welcome if welcome else ""), rows)
 
     def subscription(self, user):
         access = self.store.access(user)
         if not access:
-            self.send(user, access_status(None), [[button("Подключить VPN", "shop")]])
+            self.send(user, access_status(None), [[button("Подключить VPN", "shop")]] + back("home"))
             return
-        node = self.config.nodes.get(access["node"])
+        node = self.nodes().get(access["node"])
         title = f"\nЛокация: {node.label}." if node else "\nЛокация требует настройки владельцем."
         text = access_status(access) + title
         if (
@@ -112,29 +102,32 @@ class Bot:
             and access["applied_revision"] > 0
         ):
             text += f"\n\nСсылка для импорта в VPN-приложение:\n{Panel(node).link(access)}"
-        self.send(user, text, [[button("Продлить", "shop"), button("Как подключиться", "help")]])
+        self.send(user, text, [[button("Продлить", "shop"), button("Как подключиться", "help")]] + back("home"))
 
     def shop(self, user):
         access = self.store.access(user)
         assigned = access["node"] if access else None
         nodes = [
-            node for key, node in self.config.nodes.items()
+            node for key, node in self.nodes().items()
             if key == assigned or (not assigned and self.store.sales_open(key))
         ]
         if not nodes:
-            self.send(user, "Сейчас нет доступной локации. Напиши в поддержку.")
+            self.send(user, "Сейчас нет доступной локации.", [[button("Поддержка", "support")]] + back("home"))
             return
         trial = self.trial_days()
         used = self.store.one("SELECT 1 FROM entitlements WHERE user_id = ?", user)
         rows = []
+        payment_open = bool(self.setting("terms_url") and self.setting("support"))
         for node in nodes:
-            rows.append([button(f"{node.label} · 30 дней · {self.price()} ⭐", f"buy:{node.key}")])
+            if payment_open:
+                rows.append([button(f"{node.label} · 30 дней · {self.price()} ⭐", f"buy:{node.key}")])
             if trial > 0 and not used:
                 rows.append([button(f"{node.label} · пробный доступ ({trial} дн.)", f"trial:{node.key}")])
-        self.send(user, "Выбери локацию. Она закрепится при создании счёта или пробного доступа.", rows)
+        self.send(user, "Выбери локацию. Она закрепится при создании счёта или пробного доступа."
+                  if rows else "Владелец ещё настраивает продажи.", rows + back("home"))
 
     def purchase(self, user, key, trial=False):
-        node = self.config.nodes.get(key)
+        node = self.nodes().get(key)
         access = self.store.access(user)
         if not node or (not self.store.sales_open(key) and not (access and access["node"] == key)):
             raise ValueError("Эта локация недоступна для новых подключений.")
@@ -146,10 +139,12 @@ class Bot:
             self.store.start_trial(user, key, days, now)
             self.send(user, "Пробный доступ готовится.", [[button("Моя подписка", "subscription")]])
             return
+        if not self.setting("terms_url") or not self.setting("support"):
+            raise ValueError("Владелец ещё настраивает продажи.")
         price = self.price()
         token = self.store.create_invoice(user, key, price, now)
         self.telegram.call(
-            "sendInvoice", chat_id=user, title=f"{self.config.brand} · 30 дней",
+            "sendInvoice", chat_id=user, title=f"{self.setting('brand')} · 30 дней",
             description=f"VPN в локации {node.label} на 30 дней.",
             payload=token, currency="XTR", prices=[{"label": "30 дней VPN", "amount": price}],
             start_parameter="vpn",
@@ -158,11 +153,11 @@ class Bot:
     def precheckout(self, query):
         user = query["from"]["id"]
         access = self.store.access(user)
-        accepted = bool(access and access["node"] in self.config.nodes) and self.store.accept_checkout(
+        accepted = bool(access and access["node"] in self.nodes()) and self.store.accept_checkout(
             query["invoice_payload"], user, query["currency"],
             query["total_amount"], query["id"], int(time.time()),
         )
-        kwargs = {} if accepted else {"error_message": "Счёт устарел или уже оплачен. Создай новый через /start."}
+        kwargs = {} if accepted else {"error_message": "Счёт устарел или уже оплачен. Открой магазин и создай новый счёт."}
         self.telegram.call("answerPreCheckoutQuery", pre_checkout_query_id=query["id"], ok=accepted, **kwargs)
 
     def successful_payment(self, user, payment, timestamp):
@@ -180,73 +175,59 @@ class Bot:
                     self.send(admin, f"Платёж клиента {user} требует ручной сверки в Telegram.")
                 except ServiceError:
                     LOG.warning("Не удалось уведомить администратора")
-            self.send(user, "Оплата требует сверки. Используй /paysupport.")
+            self.send(user, "Оплата требует сверки.", [[button("Связаться с поддержкой", "support")]])
 
-    def admin_menu(self, user):
-        rows = [
-            [button("Клиенты", "admin:find"), button("Тарифы", "admin:price")],
-            [button("Серверы", "admin:nodes"), button("Платежи", "admin:payments")],
-        ]
-        if self.config.openai_key:
-            rows.append([button("ИИ-помощник", "admin:assistant")])
-        rows.append([button("Команды и журнал", "admin:help")])
-        self.send(user, "Управление VPN-магазином", rows)
-
-    def payments(self, db):
-        rows = db.db.execute(
-            "SELECT rowid AS number, * FROM payments ORDER BY paid_at DESC, number DESC LIMIT 12"
-        ).fetchall()
-        statuses = {"paid": "оплачен", "refund_pending": "возврат в очереди", "refunded": "возвращён"}
-        return "\n".join(
-            f"#{r['number']} · ID {r['user_id']} · {r['amount']} ⭐ · {statuses[r['refund_state']]}"
-            + (f" · {r['last_error']}" if r["last_error"] else "")
-            for r in rows
-        ) or "Платежей пока нет."
+    def audit(self, user):
+        rows = self.store.db.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 12").fetchall()
+        self.menu.page(user, "\n".join(f"{date(r['created_at'])} · ID {r['admin_id']} · {r['action']}"
+                                     for r in rows) or "Журнал пока пуст.")
 
     def admin_action(self, user, action, data, db):
         if user not in self.config.admins:
             return
         if action == "help":
-            self.send(user, ADMIN_HELP)
+            self.menu.page(user, "Опиши одну задачу. Например, «проверь ноды» или «выдай клиенту 123456 доступ на 30 дней».",
+                           [[button("Новая задача", "a:ai")]])
             return
         if action == "payments":
-            self.send(user, self.payments(db) + "\n\nВозврат: /refund НОМЕР.")
+            self.menu.payments(user, db)
             return
+        nodes = self.nodes(db)
         if action == "nodes":
             if data.get("node"):
-                node = self.config.nodes.get(data["node"])
+                node = nodes.get(data["node"])
                 if not node:
                     raise ValueError("Такой ноды нет в настройках.")
-                nodes = [node]
+                selected = [node]
             else:
-                nodes = list(self.config.nodes.values())
+                selected = list(nodes.values())
             lines = []
-            for node in nodes:
+            for node in selected:
                 try:
                     _, health = Panel(node).health()
                 except ServiceError as exc:
                     health = str(exc)
                 sales = "открыты" if db.sales_open(node.key) else "закрыты"
                 lines.append(f"{node.label} ({node.key}): {health}, новые продажи {sales}.")
-            self.send(user, "\n".join(lines))
+            self.menu.page(user, "\n".join(lines) or "Сначала подключи панель 3x-ui.", parent="a:nodes")
             return
         if action in ("find", "grant", "retry", "revoke"):
             target = integer(data.get("user"), 1, USER_ID_MAX)
             access = db.access(target)
             if action == "find":
-                node = self.config.nodes.get(access["node"]) if access else None
-                self.send(user, f"Подписка клиента {target}\n{access_status(access)}"
-                          + (f"\nЛокация: {node.label} ({node.key})." if node else ""))
+                node = nodes.get(access["node"]) if access else None
+                text = f"Подписка клиента {target}\n{access_status(access)}" + (f"\nЛокация: {node.label}." if node else "")
+                self.menu.client(user, target, text, bool(access and access["revision"]))
                 return
             args = {"user": target}
             if action == "grant":
                 days = integer(data.get("days"), 1, 366)
                 key = data.get("node") or (access["node"] if access else None)
-                if key is None and len(self.config.nodes) == 1:
-                    key = next(iter(self.config.nodes))
-                node = self.config.nodes.get(key)
+                if key is None and len(nodes) == 1:
+                    key = next(iter(nodes))
+                node = nodes.get(key)
                 if not node or (access and access["node"] != key):
-                    raise ValueError("Укажи ключ ноды клиента. Ключи видны в разделе «Серверы».")
+                    raise ValueError("Укажи локацию клиента. Локации видны в разделе «Панели и ноды».")
                 args.update(days=days, node=key)
                 summary = f"Добавить {days} дн. доступа клиенту {target} на ноде {node.label}?"
             elif not access or access["revision"] == 0:
@@ -264,12 +245,12 @@ class Bot:
             args = {"days": days}
             summary = f"Установить пробный период {days} дн.?" if days else "Отключить пробный период?"
         elif action == "sales":
-            node = self.config.nodes.get(data.get("node"))
+            node = nodes.get(data.get("node"))
             enabled = data.get("enabled")
             if isinstance(enabled, str):
                 enabled = {"on": True, "off": False}.get(enabled)
             if not node or type(enabled) is not bool:
-                raise ValueError("Укажи ключ ноды и on или off.")
+                raise ValueError("Выбери локацию и действие в админке.")
             args = {"node": node.key, "enabled": enabled}
             verb = "Открыть" if enabled else "Закрыть"
             summary = f"{verb} новые продажи на ноде {node.label}? Продление остаётся доступным."
@@ -285,23 +266,22 @@ class Bot:
         token = db.approval(user, action, args)
         self.send(user, summary, [[button("Подтвердить", f"confirm:{token}"), button("Отмена", f"cancel:{token}")]])
 
-    def background_admin(self, user, action, data):
+    def admin_task(self, user, callback, on_error=None):
         if not self.task_slots.acquire(blocking=False):
-            self.send(user, "Выполняются другие запросы администратора. Попробуй чуть позже.")
-            return
+            self.menu.page(user, "Выполняются другие запросы администратора. Попробуй чуть позже.")
+            return False
 
         def run():
             db = None
             try:
                 db = Store(self.config.database)
-                if action == "assistant":
-                    result = interpret(self.config, data["message"])
-                    self.admin_action(user, result["action"], result, db)
-                else:
-                    self.admin_action(user, action, data, db)
+                callback(db)
             except (ServiceError, ValueError) as exc:
                 try:
-                    self.send(user, str(exc))
+                    if on_error:
+                        on_error(str(exc))
+                    else:
+                        self.menu.page(user, str(exc))
                 except ServiceError:
                     LOG.warning("Ответ администратора не доставлен")
             except Exception:
@@ -312,6 +292,19 @@ class Bot:
                 self.task_slots.release()
 
         self.tasks.submit(run)
+        return True
+
+    def background_admin(self, user, action, data):
+        def run(db):
+            if action == "assistant":
+                cfg = replace(self.config, nodes=self.nodes(db), openai_key=self.setting("openai_key", db),
+                              openai_model=self.setting("openai_model", db))
+                result = interpret(cfg, data["message"])
+                self.admin_action(user, result["action"], result, db)
+            else:
+                self.admin_action(user, action, data, db)
+
+        self.admin_task(user, run)
 
     def client_help(self, user):
         self.send(
@@ -319,84 +312,60 @@ class Bot:
             "1. Открой «Моя подписка» и скопируй ссылку.\n"
             "2. Установи VPN-приложение с поддержкой VLESS и подписок 3x-ui для своей системы.\n"
             "3. В приложении выбери импорт подписки из URL, вставь ссылку и подключись.",
-            [[button("Моя подписка", "subscription"), button("Поддержка", "support")]],
+            [[button("Моя подписка", "subscription"), button("Поддержка", "support")]] + back("home"),
         )
 
     def callback(self, user, action):
         head, _, key = action.partition(":")
-        if head == "shop":
+        if head == "home":
+            self.start(user)
+        elif head == "shop":
+            self.menu.leave(user)
             self.shop(user)
         elif head == "subscription":
+            self.menu.leave(user)
             self.subscription(user)
         elif head == "help":
             self.client_help(user)
         elif head == "support":
             self.support(user)
+        elif head == "myid":
+            rows = [[{"text": "Скопировать ID", "copy_text": {"text": str(user)}}]]
+            self.send(user, f"Твой Telegram ID\n{user}", rows + back("home"))
         elif head == "buy":
             self.terms(user, key)
         elif head in ("invoice", "trial"):
             self.purchase(user, key, head == "trial")
         elif user in self.config.admins:
             if head == "confirm":
-                self.send(user, self.store.confirm(user, key))
+                self.menu.page(user, self.store.confirm(user, key))
             elif head == "cancel":
-                if self.store.cancel(user, key):
-                    self.send(user, "Действие отменено.")
-                else:
-                    self.send(user, "Это подтверждение уже закрыто.")
+                text = "Действие отменено." if self.store.cancel(user, key) else "Это подтверждение уже закрыто."
+                self.menu.page(user, text)
             elif head == "admin":
-                if key == "nodes":
-                    self.background_admin(user, "nodes", {})
-                elif key == "payments":
-                    self.admin_action(user, "payments", {}, self.store)
-                elif key == "find":
-                    self.send(user, "Поиск: /client ID\nВыдать доступ: /grant ID ДНИ [НОДА].")
-                elif key == "price":
-                    self.send(user, f"30 дней: {self.price()} ⭐. Пробный доступ: {self.trial_days()} дн.\n"
-                              "Изменить цену: /price STARS\nПробный период: /trial ДНИ.")
-                elif key == "assistant" and self.config.openai_key:
-                    self.send(user, "Напиши /ai и задачу. Например: /ai проверь VPN-ноды.")
-                elif key == "help":
-                    self.send(user, ADMIN_HELP)
-                else:
-                    self.admin_menu(user)
+                self.menu.home(user)
+            elif head == "a":
+                self.menu.handle_button(user, key)
+            elif head == "w":
+                nonce, _, choice = key.partition(":")
+                self.menu.choose(user, nonce, choice)
 
     def message(self, user, message):
         if payment := message.get("successful_payment"):
             self.successful_payment(user, payment, message["date"])
             return
         raw = message.get("text", "").strip()
-        command, _, params = raw.partition(" ")
-        command = command.split("@", maxsplit=1)[0]
+        if not raw:
+            return
+        command = raw.split(maxsplit=1)[0].split("@", maxsplit=1)[0]
         if command == "/start":
             self.start(user)
-        elif command == "/subscription":
-            self.subscription(user)
-        elif command == "/terms":
-            self.terms(user)
-        elif command in ("/paysupport", "/support"):
+        elif command == "/paysupport":
             self.support(user)
-        elif user in self.config.admins:
-            if command == "/admin":
-                self.admin_menu(user)
-            elif command == "/nodes":
-                self.background_admin(user, "nodes", {})
-            elif command == "/audit":
-                rows = self.store.db.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 12").fetchall()
-                self.send(user, "\n".join(f"{date(r['created_at'])} · ID {r['admin_id']} · {r['action']}"
-                                          for r in rows) or "Журнал пока пуст.")
-            elif command in COMMANDS:
-                action, names = COMMANDS[command]
-                values = params.split()
-                min_args = len(names) - (action == "grant")
-                if not min_args <= len(values) <= len(names):
-                    self.send(user, ADMIN_HELP)
-                else:
-                    self.admin_action(user, action, dict(zip(names, values)), self.store)
-            elif command == "/ai" and self.config.openai_key and 0 < len(params) <= 1500:
-                self.background_admin(user, "assistant", {"message": params})
-            elif command == "/ai":
-                self.send(user, "Для помощника нужен настроенный API OpenAI и запрос до 1500 символов.")
+        elif user in self.config.admins and self.menu.current(user):
+            self.menu.message(user, raw, message["message_id"])
+        else:
+            self.start(user)
 
     def handle(self, update):
         if query := update.get("pre_checkout_query"):
@@ -429,4 +398,5 @@ class Bot:
         try:
             action()
         except ValueError as exc:
-            self.send(user, str(exc))
+            draft = self.menu.current(user) if user in self.config.admins else None
+            self.send(user, str(exc), back(draft.parent if draft else ("admin" if user in self.config.admins else "home")))

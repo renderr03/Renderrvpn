@@ -17,7 +17,7 @@ LOG = logging.getLogger("renderrvpn")
 
 
 def synchronize_access(store, bot, access, now):
-    node = bot.config.nodes.get(access["node"])
+    node = store.nodes(bot.config.nodes).get(access["node"])
     try:
         if not node:
             raise ServiceError("3x-ui", "нода отсутствует в nodes.json")
@@ -113,7 +113,7 @@ def run(config):
             signal.signal(sig, lambda *_: stop.set())
         worker = Thread(target=process_pending, args=(bot, stop), name="sync")
         worker.start()
-        LOG.info("Бот запущен. Нод настроено: %d.", len(config.nodes))
+        LOG.info("Бот запущен. Нод настроено: %d.", len(bot.nodes()))
         try:
             poll(bot, stop)
         finally:
@@ -134,14 +134,23 @@ def main():
         config = Config.from_env()
         if args.check_nodes:
             okay = True
-            for node in config.nodes.values():
+            nodes = config.nodes
+            if config.database.is_file():
+                store = Store(config.database)
+                try:
+                    nodes = store.nodes(nodes)
+                finally:
+                    store.db.close()
+            for node in nodes.values():
                 try:
                     healthy, status = Panel(node).health()
                 except ServiceError as exc:
                     healthy, status = False, str(exc)
                 print(f"{node.key}: {status}")
                 okay = okay and healthy
-            return 0 if okay else 1
+            if not nodes:
+                print("Добавь первую панель в админке бота.")
+            return 0 if okay and nodes else 1
         if args.check_config:
             print(f"Настройки корректны. Нод: {len(config.nodes)}.")
         else:

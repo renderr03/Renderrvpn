@@ -3,7 +3,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 
 def integer(value, minimum, maximum):
@@ -18,15 +18,30 @@ def integer(value, minimum, maximum):
     return result
 
 
-def https_base(value):
+def https_base(value, *, local_http=False):
     url = urlsplit(value)
     if (
-        url.scheme != "https" or not url.hostname or url.username is not None
+        (url.scheme != "https" and not (local_http and url.scheme == "http" and url.hostname in {"127.0.0.1", "::1", "localhost"}))
+        or not url.hostname or url.username is not None
         or url.query or url.fragment or any(c.isspace() for c in value)
         or "\\" in value
     ):
         raise ValueError("Укажи HTTPS-адрес без логина, пароля, запроса и фрагмента.")
+    _ = url.port
     return value.rstrip("/")
+
+
+def panel_base(value):
+    url = urlsplit(https_base(value, local_http=True))
+    path = re.sub(r"/(?:panel(?:/(?:inbounds|settings|clients|nodes))?|login)/?$", "", url.path)
+    return urlunsplit(url._replace(path=path)).rstrip("/")
+
+
+def support_username(value):
+    value = value.strip().removeprefix("https://t.me/").lstrip("@")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", value):
+        raise ValueError("Укажи Telegram-имя поддержки, например @vpn_support.")
+    return value
 
 
 @dataclass(frozen=True)
@@ -54,7 +69,7 @@ class Node:
         if flow not in ("", "xtls-rprx-vision"):
             raise ValueError("Укажи пустой flow или xtls-rprx-vision.")
         return cls(
-            key, label, https_base(data["api_url"]), https_base(data["subscription_url"]),
+            key, label, https_base(data["api_url"], local_http=True), https_base(data["subscription_url"]),
             integer(data["inbound_id"], 1, 2**31 - 1), token, flow,
         )
 
@@ -81,16 +96,16 @@ class Config:
         token = env.get("TELEGRAM_BOT_TOKEN", "").strip()
         if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{20,}", token):
             raise ValueError("Укажи TELEGRAM_BOT_TOKEN от BotFather.")
-        support = env.get("SUPPORT_USERNAME", "").strip().lstrip("@")
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", support):
-            raise ValueError("Укажи Telegram-имя поддержки в SUPPORT_USERNAME.")
+        support = env.get("SUPPORT_USERNAME", "").strip()
+        terms = env.get("TERMS_URL", "").strip()
         admins = frozenset(
             integer(part.strip(), 1, 2**52 - 1)
             for part in env.get("ADMIN_IDS", "").split(",")
         )
-        data = json.loads(Path(env.get("NODES_FILE", "nodes.json")).read_text())
-        if not isinstance(data, list) or not 1 <= len(data) <= 20:
-            raise ValueError("В nodes.json должна быть от 1 до 20 нод.")
+        nodes_file = Path(env.get("NODES_FILE", "nodes.json"))
+        data = json.loads(nodes_file.read_text()) if nodes_file.is_file() else []
+        if not isinstance(data, list) or len(data) > 20:
+            raise ValueError("В nodes.json допускается до 20 нод.")
         nodes = {node.key: node for node in map(Node.read, data)}
         if len(nodes) != len(data):
             raise ValueError("Ключи нод должны различаться.")
@@ -103,10 +118,8 @@ class Config:
             raise ValueError("Название бота должно быть до 36 символов, приветствие до 1000.")
         key = env.get("OPENAI_API_KEY", "").strip()
         model = env.get("OPENAI_MODEL", "").strip()
-        if key and not model:
-            raise ValueError("С OPENAI_API_KEY укажи OPENAI_MODEL.")
         return cls(
-            token, admins, brand, welcome, support, https_base(env.get("TERMS_URL", "")),
+            token, admins, brand, welcome, support_username(support) if support else "", https_base(terms) if terms else "",
             bool(integer(env.get("TELEGRAM_TEST_MODE", "0"), 0, 1)),
             integer(env.get("PRICE_STARS", "150"), 1, 10_000),
             integer(env.get("TRIAL_DAYS", "0"), 0, 30),
