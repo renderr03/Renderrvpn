@@ -1,0 +1,11 @@
+[
+  {
+    "key": "de",
+    "label": "Германия",
+    "api_url": "https://panel.example.com/your-panel-base-path",
+    "subscription_url": "https://sub.example.com/sub",
+    "inbound_id": 1,
+    "flow": "xtls-rprx-vision",
+    "token": "REPLACE_WITH_PANEL_TOKEN"
+  }
+]

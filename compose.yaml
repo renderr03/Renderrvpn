@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    init: true
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/renderrvpn.sqlite3
+      NODES_FILE: /app/nodes.json
+    volumes:
+      - bot-data:/app/data
+      - ./nodes.json:/app/nodes.json:ro
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 45s
+
+volumes:
+  bot-data:
