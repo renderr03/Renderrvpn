@@ -44,6 +44,13 @@ def support_username(value):
     return value
 
 
+def subscription_origin(value):
+    base = https_base(value)
+    if urlsplit(base).path or len(base) > 256:
+        raise ValueError("Укажи HTTPS-домен без пути, например https://sub.example.com.")
+    return base
+
+
 @dataclass(frozen=True)
 class Node:
     key: str
@@ -89,6 +96,8 @@ class Config:
     database: Path
     openai_key: str = field(repr=False)
     openai_model: str
+    subscription_host: str = "127.0.0.1"
+    subscription_port: int = 8787
 
     @classmethod
     def from_env(cls):
@@ -118,10 +127,14 @@ class Config:
             raise ValueError("Название бота должно быть до 36 символов, приветствие до 1000.")
         key = env.get("OPENAI_API_KEY", "").strip()
         model = env.get("OPENAI_MODEL", "").strip()
+        subscription_host = env.get("SUBSCRIPTION_HOST", "127.0.0.1").strip()
+        if subscription_host not in ("127.0.0.1", "0.0.0.0"):
+            raise ValueError("SUBSCRIPTION_HOST должен быть 127.0.0.1 или 0.0.0.0.")
         return cls(
             token, admins, brand, welcome, support_username(support) if support else "", https_base(terms) if terms else "",
             bool(integer(env.get("TELEGRAM_TEST_MODE", "0"), 0, 1)),
             integer(env.get("PRICE_STARS", "150"), 1, 10_000),
             integer(env.get("TRIAL_DAYS", "0"), 0, 30),
             nodes, Path(env.get("DATABASE_PATH", "data/renderrvpn.sqlite3")), key, model,
+            subscription_host, integer(env.get("SUBSCRIPTION_PORT", "8787"), 1024, 65535),
         )

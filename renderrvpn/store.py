@@ -5,6 +5,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, replace
+from pathlib import Path
 
 from .config import Node
 
@@ -76,16 +77,48 @@ CREATE TABLE IF NOT EXISTS node_sales (
     node TEXT PRIMARY KEY,
     enabled INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS node_health (
+    node TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    failures INTEGER NOT NULL,
+    checked_at INTEGER NOT NULL,
+    detail TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS expiry_reminders (
+    user_id INTEGER NOT NULL REFERENCES access(user_id),
+    expires_at INTEGER NOT NULL,
+    done INTEGER NOT NULL,
+    retry_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, expires_at)
+);
+CREATE TABLE IF NOT EXISTS placements (
+    user_id INTEGER NOT NULL REFERENCES access(user_id),
+    node TEXT NOT NULL,
+    panel_email TEXT NOT NULL,
+    client_uuid TEXT NOT NULL,
+    sub_id TEXT NOT NULL,
+    confirmed_revision INTEGER NOT NULL DEFAULT 0,
+    confirmed_enabled INTEGER NOT NULL DEFAULT 0,
+    profiles TEXT NOT NULL DEFAULT '',
+    refresh_at INTEGER NOT NULL DEFAULT 0,
+    retry_at INTEGER NOT NULL DEFAULT 0,
+    retry_revision INTEGER NOT NULL DEFAULT 0,
+    retry_enabled INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, node)
+);
+CREATE INDEX IF NOT EXISTS active_expiry ON access(desired_enabled, expires_at);
 """
 
 
 class Store:
-    def __init__(self, path):
-        self.db = sqlite3.connect(path, isolation_level=None, timeout=10)
+    def __init__(self, path, *, read_only=False):
+        source = Path(path).resolve().as_uri() + "?mode=ro" if read_only else path
+        self.db = sqlite3.connect(source, uri=read_only, isolation_level=None, timeout=10)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys = ON")
-        self.db.execute("PRAGMA journal_mode = WAL")
-        self.db.executescript(DATABASE)
+        if not read_only:
+            self.db.execute("PRAGMA foreign_keys = ON")
+            self.db.execute("PRAGMA journal_mode = WAL")
+            self.db.executescript(DATABASE)
 
     @contextmanager
     def write(self):
@@ -146,6 +179,112 @@ class Store:
 
     def access(self, user_id):
         return self.one("SELECT * FROM access WHERE user_id = ?", user_id)
+
+    def node_health(self, key):
+        return self.one("SELECT * FROM node_health WHERE node = ?", key)
+
+    def record_health(self, key, ok, detail, now):
+        with self.write():
+            last = self.node_health(key)
+            before = last["status"] if last else "unknown"
+            failures = 0 if ok else (last["failures"] if last else 0) + 1
+            status = "online" if ok else ("offline" if failures >= 2 else before)
+            self.db.execute("INSERT OR REPLACE INTO node_health VALUES (?, ?, ?, ?, ?)",
+                            (key, status, failures, now, detail))
+        if status != before and (status == "offline" or before == "offline"):
+            return status
+        return None
+
+    def next_reminder(self, now):
+        return self.one(
+            """SELECT a.user_id, a.expires_at FROM access a
+               LEFT JOIN expiry_reminders r ON a.user_id = r.user_id AND a.expires_at = r.expires_at
+               WHERE a.desired_enabled = 1 AND a.expires_at BETWEEN ? AND ?
+                 AND (a.applied_revision > 0 OR EXISTS (
+                     SELECT 1 FROM placements p WHERE p.user_id = a.user_id
+                       AND p.confirmed_enabled = 1 AND p.confirmed_revision = a.revision AND p.profiles != ''
+                 ))
+                 AND (r.done IS NULL OR (r.done = 0 AND r.retry_at <= ?))
+               ORDER BY a.expires_at LIMIT 1""",
+            now + 1, now + DAY, now,
+        )
+
+    def mark_reminder(self, reminder, done, retry_at=0):
+        self.db.execute("INSERT OR REPLACE INTO expiry_reminders VALUES (?, ?, ?, ?)",
+                        (reminder["user_id"], reminder["expires_at"], done, retry_at))
+
+    def seed_placements(self, nodes, now):
+        for key in nodes:
+            opened = self.sales_open(key)
+            candidates = self.db.execute(
+                """SELECT a.* FROM access a WHERE a.desired_enabled = 1 AND a.expires_at > ?
+                   AND (a.node = ? OR ?) AND NOT EXISTS (
+                       SELECT 1 FROM placements p WHERE p.node = ? AND p.user_id = a.user_id
+                   ) LIMIT 20""",
+                (now, key, opened, key),
+            ).fetchall()
+            identities = []
+            for a in candidates:
+                primary = a["node"] == key
+                identities.append((
+                    a["user_id"], key,
+                    a["panel_email"] if primary else f"rvpn-{a['user_id']}-{secrets.token_hex(5)}",
+                    a["client_uuid"] if primary else str(uuid.uuid4()),
+                    a["sub_id"] if primary else secrets.token_hex(16),
+                ))
+            if identities:
+                self.db.executemany(
+                    """INSERT OR IGNORE INTO placements(user_id, node, panel_email, client_uuid, sub_id)
+                       VALUES (?, ?, ?, ?, ?)""", identities,
+                )
+
+    def next_placement(self, now):
+        return self.db.execute(
+            """WITH desired AS (
+                   SELECT p.*, a.node AS primary_node, a.expires_at, a.revision, a.applied_revision,
+                          (a.desired_enabled = 1 AND a.expires_at > :now AND EXISTS (
+                             SELECT 1 FROM settings WHERE key = 'unified_url' AND value != ''
+                          )) AS wanted
+                   FROM placements p JOIN access a ON a.user_id = p.user_id
+               )
+               SELECT * FROM desired
+               WHERE (retry_at <= :now OR retry_revision != revision OR retry_enabled != wanted)
+                 AND (node != primary_node OR (wanted AND applied_revision = revision))
+                 AND (revision != confirmed_revision OR wanted != confirmed_enabled
+                      OR (wanted AND refresh_at <= :now))
+               ORDER BY CASE WHEN wanted THEN 1 ELSE 0 END,
+                        CASE WHEN revision != confirmed_revision THEN 0 ELSE 1 END, refresh_at
+               LIMIT 1""", {"now": now},
+        ).fetchone()
+
+    def complete_placement(self, placement, now, profiles):
+        self.db.execute(
+            """UPDATE placements SET confirmed_revision = ?, confirmed_enabled = ?, profiles = ?,
+               refresh_at = ?, retry_at = 0 WHERE user_id = ? AND node = ?""",
+            (placement["revision"], placement["wanted"], "\n".join(profiles), now + 900,
+             placement["user_id"], placement["node"]),
+        )
+
+    def defer_placement(self, placement, now):
+        self.db.execute(
+            """UPDATE placements SET profiles = '', retry_at = ?, retry_revision = ?, retry_enabled = ?
+               WHERE user_id = ? AND node = ?""",
+            (now + 45, placement["revision"], placement["wanted"], placement["user_id"], placement["node"]),
+        )
+
+    def subscription_profiles(self, sub_id, now):
+        rows = self.db.execute(
+            """SELECT p.node, p.profiles, a.expires_at FROM access a
+               JOIN placements p ON p.user_id = a.user_id
+               LEFT JOIN node_health h ON h.node = p.node
+               WHERE a.sub_id = ? AND a.desired_enabled = 1 AND a.expires_at > ?
+                 AND EXISTS (SELECT 1 FROM settings WHERE key = 'unified_url' AND value != '')
+                 AND p.confirmed_revision = a.revision AND p.confirmed_enabled = 1 AND p.profiles != ''
+                 AND p.refresh_at + 900 > ? AND COALESCE(h.status, '') != 'offline'
+               ORDER BY p.node != a.node, p.node""",
+            (sub_id, now, now),
+        ).fetchall()
+        return rows
 
     def ensure_access(self, user_id, node):
         row = self.access(user_id)

@@ -9,8 +9,10 @@ from threading import Event, Thread
 
 from .bot import Bot, button
 from .config import Config
+from .jobs import service_notifications, service_placements
 from .services import Panel, ServiceError, Telegram
 from .store import Store
+from .subscriptions import SubscriptionServer
 
 
 LOG = logging.getLogger("renderrvpn")
@@ -111,14 +113,33 @@ def run(config):
         stop = Event()
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: stop.set())
-        worker = Thread(target=process_pending, args=(bot, stop), name="sync")
-        worker.start()
+        server = None
+        try:
+            server = SubscriptionServer((config.subscription_host, config.subscription_port), config.database)
+        except OSError:
+            LOG.warning("Локальный порт единой подписки недоступен. Telegram-бот запустится штатно.")
+        bot.unified_available = server is not None
+        workers = [
+            Thread(target=task, args=(bot, stop), name=label)
+            for task, label in (
+                (process_pending, "sync"), (service_notifications, "notifications"),
+                (service_placements, "placements"),
+            )
+        ]
+        if server:
+            workers.append(Thread(target=server.serve_forever, name="subscriptions"))
+        for worker in workers:
+            worker.start()
         LOG.info("Бот запущен. Нод настроено: %d.", len(bot.nodes()))
         try:
             poll(bot, stop)
         finally:
             stop.set()
-            worker.join()
+            if server:
+                server.shutdown()
+                server.server_close()
+            for worker in workers:
+                worker.join()
             bot.tasks.shutdown()
             store.db.close()
 

@@ -3,7 +3,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from threading import RLock
 
-from .config import Node, https_base, integer, panel_base, support_username
+from .config import Node, https_base, integer, panel_base, subscription_origin, support_username
 from .services import Panel, ServiceError
 
 
@@ -13,6 +13,7 @@ SETTINGS = {
     "welcome": ("Приветствие", "Отправь приветствие. До 1000 символов."),
     "support": ("Контакт поддержки", "Отправь Telegram-имя поддержки. Например, @vpn_support."),
     "terms_url": ("Условия покупки", "Отправь HTTPS-ссылку на условия покупки."),
+    "unified_url": ("Единая подписка", "Отправь HTTPS-домен обратного прокси для единой подписки. Пример https://sub.example.com."),
     "openai_key": ("Ключ OpenAI", "Отправь ключ OpenAI. Бот попробует удалить сообщение с ключом."),
     "openai_model": ("Модель OpenAI", "Отправь название модели с поддержкой Structured Outputs."),
 }
@@ -97,7 +98,9 @@ class AdminMenu:
         if not node:
             raise ValueError("Локация не найдена.")
         opened = self.bot.store.sales_open(key)
-        self.page(user, f"{node.label}\nInbound {node.inbound_id}\nНовые продажи {'открыты' if opened else 'закрыты'}.",
+        health = self.bot.store.node_health(key)
+        detail = health["detail"] if health else "проверка ещё не выполнялась"
+        self.page(user, f"{node.label}\nInbound {node.inbound_id}\nНовые продажи {'открыты' if opened else 'закрыты'}.\nМониторинг · {detail}.",
                   [[button("Проверить состояние", f"a:health:{key}")],
                    [button("Закрыть новые продажи" if opened else "Открыть новые продажи",
                            f"a:sales:{key}:{int(not opened)}")],
@@ -131,10 +134,14 @@ class AdminMenu:
             rows.append([button("Очистить приветствие", "a:clear:welcome")])
         if self.bot.setting("openai_key"):
             rows.append([button("Выключить ИИ-помощника", "a:clear:openai_key")])
+        unified = self.bot.store.setting("unified_url", "")
+        if unified:
+            rows.append([button("Отключить единую подписку", "a:unified_off")])
         brand = self.bot.setting("brand")
         support_status = "указан" if self.bot.setting("support") else "нужно указать"
         terms_status = "указана" if self.bot.setting("terms_url") else "нужно указать"
-        self.page(user, f"Магазин {brand}\nКонтакт поддержки {support_status}.\nСсылка на условия {terms_status}.", rows)
+        status = unified if unified else "выключена"
+        self.page(user, f"Магазин {brand}\nКонтакт поддержки {support_status}.\nСсылка на условия {terms_status}.\nЕдиная подписка · {status}", rows)
 
     def add_node(self, user):
         panels = {node.api_url: node for node in self.bot.nodes().values()}
@@ -281,6 +288,12 @@ class AdminMenu:
         elif draft.step == "grant_location":
             self.leave(user)
             self.bot.admin_action(user, "grant", dict(data, node=choice), self.bot.store)
+        elif draft.step == "unified_off" and choice == "confirm":
+            self.save_setting(user, "unified_url", "")
+            self.settings(user)
+        elif draft.step == "unified_on" and choice == "confirm":
+            self.save_setting(user, "unified_url", data["url"])
+            self.settings(user)
         else:
             self.page(user, "Выбери действие в меню.")
 
@@ -326,6 +339,14 @@ class AdminMenu:
                 text = support_username(text)
             elif name == "terms_url":
                 text = https_base(text)
+            elif name == "unified_url":
+                if not self.bot.unified_available:
+                    raise ValueError("Локальный порт единой подписки недоступен. Проверь настройки запуска на VPS.")
+                text = subscription_origin(text)
+                self.prompt(user, "unified_on",
+                            f"Включить единую подписку на {text}? Бот начнёт выдавать действующим клиентам профили на открытых нодах.",
+                            "a:settings", {"url": text}, (("Подтвердить", "confirm"),))
+                return
             elif name == "openai_key":
                 self.erase_secret(user, message_id)
                 if not text or len(text) > 512 or not text.isascii() or not text.isprintable() or " " in text:
@@ -413,6 +434,9 @@ class AdminMenu:
         elif action == "clear" and key in {"welcome", "openai_key"}:
             self.save_setting(user, key, "")
             self.settings(user)
+        elif action == "unified_off":
+            self.prompt(user, "unified_off", "Отключение скроет единую ссылку. Дополнительные профили клиентов будут отозваны.",
+                        "a:settings", choices=(("Подтвердить отключение", "confirm"),))
         elif action == "ai":
             if self.bot.setting("openai_key") and self.bot.setting("openai_model"):
                 self.prompt(user, "ai", "Опиши задачу. Например, «проверь VPN-ноды» или «измени тариф на 200 Stars».", "admin")

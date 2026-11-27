@@ -1,7 +1,11 @@
+import base64
+import binascii
 import json
+import secrets
+import subprocess
 from http.client import HTTPException
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
@@ -29,7 +33,10 @@ def request_json(service, url, *, payload=None, token=None, timeout=8):
         headers["Content-Type"] = "application/json"
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = Request(url, data=body, headers=headers)
+    return response_json(service, Request(url, data=body, headers=headers), timeout)
+
+
+def response_json(service, req, timeout=8):
     try:
         with OPENER.open(req, timeout=timeout) as response:
             raw = response.read(MAX_RESPONSE + 1)
@@ -62,9 +69,46 @@ class Telegram:
     def call(self, method, **payload):
         timeout = payload.get("timeout", 0) + 6 if method == "getUpdates" else 8
         data = request_json("Telegram", self.base + method, payload=payload, timeout=timeout)
+        return self.result(data)
+
+    @staticmethod
+    def result(data):
         if data.get("ok") is not True:
             raise ServiceError("Telegram", data.get("error_code"), data.get("description"))
         return data["result"]
+
+    def photo(self, chat, image, caption, rows):
+        boundary = secrets.token_hex(24)
+        fields = {
+            "chat_id": str(chat),
+            "caption": caption,
+            "reply_markup": json.dumps({"inline_keyboard": rows}),
+        }
+        parts = [
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+            for key, value in fields.items()
+        ]
+        parts.extend([
+            f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="vpn.png"\r\n'
+            'Content-Type: image/png\r\n\r\n'.encode(),
+            image, f"\r\n--{boundary}--\r\n".encode(),
+        ])
+        req = Request(self.base + "sendPhoto", data=b"".join(parts),
+                      headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        return self.result(response_json("Telegram", req))
+
+
+def qr_png(link):
+    try:
+        result = subprocess.run(
+            ["qrencode", "-t", "PNG", "-s", "6", "-o", "-"],
+            input=link.encode(), capture_output=True, timeout=4, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise ServiceError("QR-код", "временно недоступен") from None
+    if not result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ServiceError("QR-код", "не удалось создать изображение")
+    return result.stdout
 
 
 class Panel:
@@ -158,3 +202,30 @@ class Panel:
 
     def link(self, access):
         return f"{self.node.subscription_url}/{quote(access['sub_id'], safe='')}"
+
+    def profiles(self, access):
+        limit = 128 * 1024
+        req = Request(self.link(access), headers={"Accept": "text/plain", "User-Agent": "RenderrVPN/1.0"})
+        try:
+            with OPENER.open(req, timeout=8) as response:
+                payload = response.read(limit + 1).strip()
+            if not payload or len(payload) > limit:
+                raise ValueError
+            if not payload.startswith(b"vless://"):
+                payload = b"".join(payload.split())
+                payload = base64.b64decode(payload + b"=" * (-len(payload) % 4), validate=True)
+            links = []
+            for line in payload.decode().splitlines():
+                line = line.strip()
+                url = urlsplit(line)
+                if (
+                    len(line) <= 4096 and line.isprintable() and url.scheme == "vless"
+                    and url.hostname and url.port and url.username == access["client_uuid"]
+                    and url.password is None
+                ):
+                    links.append(line)
+        except (OSError, HTTPException, ValueError, binascii.Error):
+            raise ServiceError("3x-ui", "ссылка подписки недоступна") from None
+        if not links:
+            raise ServiceError("3x-ui", "панель ещё не опубликовала VLESS-профиль")
+        return list(dict.fromkeys(links))[:12]

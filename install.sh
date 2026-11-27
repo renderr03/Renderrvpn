@@ -38,6 +38,16 @@ if ! /usr/bin/python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/d
     fi
 fi
 
+if ! command -v qrencode >/dev/null; then
+    if command -v apt-get >/dev/null; then
+        if ! (apt-get update && apt-get install -y --no-install-recommends qrencode); then
+            printf '%s\n' 'Не удалось установить qrencode. Кнопка QR-кода заработает после установки пакета.' >&2
+        fi
+    else
+        printf '%s\n' 'Для QR-кодов установи qrencode из репозитория своего дистрибутива.' >&2
+    fi
+fi
+
 install -d -m 0755 "$app" "$app/releases"
 install -d -m 0700 "$config"
 work=$(mktemp -d)

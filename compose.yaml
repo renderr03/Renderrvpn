@@ -6,6 +6,7 @@ services:
     environment:
       DATABASE_PATH: /app/data/renderrvpn.sqlite3
       NODES_FILE: /app/nodes.json
+      SUBSCRIPTION_HOST: 0.0.0.0
     volumes:
       - bot-data:/app/data
       - ./nodes.json:/app/nodes.json:ro

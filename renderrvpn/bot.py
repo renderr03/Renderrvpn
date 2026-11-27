@@ -8,7 +8,7 @@ from threading import BoundedSemaphore
 from .assistant import interpret
 from .config import integer
 from .menu import AdminMenu, USER_ID_MAX, back, button
-from .services import Panel, ServiceError
+from .services import Panel, ServiceError, qr_png
 from .store import Store
 
 
@@ -42,6 +42,7 @@ class Bot:
         self.tasks = ThreadPoolExecutor(max_workers=2, thread_name_prefix="admin")
         self.task_slots = BoundedSemaphore(2)
         self.menu = AdminMenu(self)
+        self.unified_available = False
 
     def send(self, chat, text, rows=None):
         payload = {"chat_id": chat, "text": text, "link_preview_options": {"is_disabled": True}}
@@ -89,20 +90,51 @@ class Bot:
         welcome = self.setting("welcome")
         self.send(user, self.setting("brand") + ("\n\n" + welcome if welcome else ""), rows)
 
-    def subscription(self, user):
+    def subscription_links(self, access):
+        now = int(time.time())
+        if not access or not access["desired_enabled"] or access["expires_at"] <= now:
+            return None, None
+        node = self.nodes().get(access["node"])
+        direct = Panel(node).link(access) if node and access["applied_revision"] > 0 else None
+        base = self.store.setting("unified_url")
+        unified = None
+        if base and self.unified_available and self.store.subscription_profiles(access["sub_id"], now):
+            unified = f"{base}/sub/{access['sub_id']}"
+        return unified, direct
+
+    def subscription(self, user, *, direct_only=False):
         access = self.store.access(user)
         if not access:
             self.send(user, access_status(None), [[button("Подключить VPN", "shop")]] + back("home"))
             return
         node = self.nodes().get(access["node"])
-        title = f"\nЛокация: {node.label}." if node else "\nЛокация требует настройки владельцем."
+        unified, direct = self.subscription_links(access)
+        link = direct if direct_only else (unified or direct)
+        location = ("Основная локация" if unified and not direct_only else "Локация")
+        title = f"\n{location} · {node.label}." if node else "\nЛокация требует настройки владельцем."
         text = access_status(access) + title
-        if (
-            node and access["desired_enabled"] and access["expires_at"] > time.time()
-            and access["applied_revision"] > 0
-        ):
-            text += f"\n\nСсылка для импорта в VPN-приложение:\n{Panel(node).link(access)}"
-        self.send(user, text, [[button("Продлить", "shop"), button("Как подключиться", "help")]] + back("home"))
+        rows = [[button("Продлить", "shop"), button("Как подключиться", "help")]]
+        if link:
+            label = "Единая подписка" if link == unified else "Прямая ссылка"
+            text += f"\n\n{label} для импорта в VPN-приложение\n{link}"
+            extra = [button("QR-код", "qr:direct" if direct_only else "qr")]
+            if len(link) <= 256:
+                extra.insert(0, {"text": "Скопировать ссылку", "copy_text": {"text": link}})
+            rows.append(extra)
+        if not direct_only and unified and direct:
+            rows.append([button("Прямая ссылка", "direct")])
+        self.send(user, text, rows + back("subscription" if direct_only else "home"))
+
+    def subscription_qr(self, user, *, direct_only=False):
+        unified, direct = self.subscription_links(self.store.access(user))
+        link = direct if direct_only else (unified or direct)
+        if not link:
+            self.send(user, "QR-код появится после выдачи VPN-профиля.", back("subscription"))
+            return
+        try:
+            self.telegram.photo(user, qr_png(link), "Отсканируй QR-код в VPN-приложении.", back("subscription"))
+        except ServiceError:
+            self.send(user, "QR-код сейчас недоступен. Ссылку можно скопировать в подписке.", back("subscription"))
 
     def shop(self, user):
         access = self.store.access(user)
@@ -322,9 +354,11 @@ class Bot:
         elif head == "shop":
             self.menu.leave(user)
             self.shop(user)
-        elif head == "subscription":
+        elif head in ("subscription", "direct"):
             self.menu.leave(user)
-            self.subscription(user)
+            self.subscription(user, direct_only=head == "direct")
+        elif head == "qr":
+            self.subscription_qr(user, direct_only=key == "direct")
         elif head == "help":
             self.client_help(user)
         elif head == "support":
